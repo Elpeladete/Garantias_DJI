@@ -551,18 +551,27 @@ function uploadVideoToYouTube(taskId, videoData, title, description) {
     Logger.log('TaskID: ' + taskId);
     Logger.log('Título: ' + title);
 
-    // Obtener credenciales de YouTube
-    Logger.log('Obteniendo credenciales de YouTube...');
-    const clientId = SCRIPT_PROPERTIES.getProperty('YOUTUBE_CLIENT_ID');
-    const clientSecret = SCRIPT_PROPERTIES.getProperty('YOUTUBE_CLIENT_SECRET');
+    // Obtener e inicializar el servicio de YouTube
+    const service = getYouTubeService();
     
-    if (!clientId || !clientSecret) {
-      const error = 'No se han configurado las credenciales de YouTube';
-      Logger.log('Error: ' + error);
-      throw new Error(error);
+    // Verificar la autorización
+    if (!service.hasAccess()) {
+      Logger.log('No hay acceso autorizado a YouTube');
+      const authorizationUrl = service.getAuthorizationUrl();
+      Logger.log('URL de autorización: ' + authorizationUrl);
+      
+      // Guardar datos temporales para después de la autorización
+      SCRIPT_PROPERTIES.setProperty('PENDING_UPLOAD', JSON.stringify({
+        taskId: taskId,
+        title: title,
+        description: description
+      }));
+      
+      throw new Error('Autorización requerida. Por favor, visite: ' + authorizationUrl);
     }
-    Logger.log('Credenciales de YouTube obtenidas correctamente');
 
+    Logger.log('Servicio autorizado, procesando video...');
+    
     // Convertir datos base64 a blob
     Logger.log('Convirtiendo datos del video...');
     const contentType = getContentTypeFromBase64(videoData);
@@ -572,165 +581,272 @@ function uploadVideoToYouTube(taskId, videoData, title, description) {
       const blob = Utilities.newBlob(Utilities.base64Decode(videoData.split(',')[1]), contentType, title);
       Logger.log('Video convertido a blob correctamente');
       Logger.log('Tamaño del video: ' + blob.getBytes().length + ' bytes');
+      
+      // Inicializar progreso
+      updateUploadProgress(0);
+      
+      const chunkSize = 1024 * 1024; // 1MB por chunk
+      const totalSize = blob.getBytes().length;
+      const totalChunks = Math.ceil(totalSize / chunkSize);
+      
+      let uploadedSize = 0;
+      let lastProgress = 0;
+      
+      // Iniciar la sesión de subida
+      const uploadSession = initializeUpload(service, title, description);
+      
+      // Subir chunks
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, totalSize);
+        const chunk = blob.getBytes().slice(start, end);
+        
+        // Subir chunk
+        uploadChunk(service, uploadSession.uploadUrl, chunk, start, totalSize);
+        
+        // Actualizar progreso
+        uploadedSize += (end - start);
+        const progress = Math.round((uploadedSize / totalSize) * 100);
+        
+        // Actualizar progreso si ha cambiado
+        if (progress > lastProgress) {
+          updateUploadProgress(progress);
+          lastProgress = progress;
+          // Agregar un pequeño retraso para evitar sobrecarga
+          Utilities.sleep(100);
+        }
+      }
+      
+      // Finalizar la subida
+      const videoId = completeUpload(service, uploadSession.uploadUrl);
+      
+      // Asegurar que se muestre 100% al completar
+      updateUploadProgress(100);
+      
+      Logger.log('Video subido exitosamente con ID: ' + videoId);
+      return videoId;
+      
     } catch (conversionError) {
-      Logger.log('Error al convertir video: ' + conversionError);
-      throw new Error('Error al procesar el archivo de video: ' + conversionError.message);
+      Logger.log('Error en la conversión/subida del video: ' + conversionError);
+      throw conversionError;
     }
-
-    // Autenticar con YouTube
-    Logger.log('Iniciando autenticación con YouTube...');
-    const service = getYouTubeService();
-    
-    if (!service.hasAccess()) {
-      Logger.log('Error: No hay acceso autorizado a YouTube');
-      Logger.log('URL de autorización: ' + service.getAuthorizationUrl());
-      throw new Error('No se ha autorizado el acceso a YouTube. Por favor, configure la autorización en la configuración.');
-    }
-    Logger.log('Autenticación con YouTube exitosa');
-
-    // Subir el video a YouTube
-    Logger.log('Iniciando subida del video...');
-    const videoId = uploadVideoToYouTubeAPI(service, blob, title, description);
-    
-    if (!videoId) {
-      Logger.log('Error: No se recibió ID del video');
-      throw new Error('Error al subir el video a YouTube');
-    }
-    Logger.log('Video subido exitosamente. ID: ' + videoId);
-
-    // Adjuntar el enlace del video a la tarea
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    Logger.log('Adjuntando enlace del video a la tarea...');
-    attachYouTubeLink(taskId, videoUrl, title);
-    
-    // Registrar actividad
-    const userEmail = Session.getActiveUser().getEmail();
-    logActivity('add_attachment', 'Video subido a YouTube y adjuntado', JSON.stringify({
-      taskId: taskId,
-      videoId: videoId,
-      videoTitle: title,
-      userEmail: userEmail
-    }));
-    
-    Logger.log('Proceso completado exitosamente');
-    return videoId;
-    
   } catch (error) {
     Logger.log('Error fatal en uploadVideoToYouTube: ' + error);
     Logger.log('Stack: ' + error.stack);
-    throw new Error('Error al subir video a YouTube: ' + error.message);
+    throw error;
   }
 }
 
-function uploadVideoToYouTubeAPI(service, videoBlob, title, description) {
+// Nuevas funciones auxiliares para la subida en chunks
+function initializeUpload(service, title, description) {
   try {
-    Logger.log('Iniciando uploadVideoToYouTubeAPI...');
-    
+    Logger.log('Inicializando sesión de subida...');
     const metadata = {
       snippet: {
         title: title,
-        description: description || '',
-        categoryId: '22' // Categoría "People & Blogs"
+        description: description || ''
       },
       status: {
-        privacyStatus: 'unlisted' // Video no listado
+        privacyStatus: 'unlisted'
       }
     };
     
-    Logger.log('Metadata preparada: ' + JSON.stringify(metadata));
+    const response = UrlFetchApp.fetch(
+      'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + service.getAccessToken(),
+          'Content-Type': 'application/json',
+          'X-Upload-Content-Type': 'video/*'
+        },
+        payload: JSON.stringify(metadata),
+        muteHttpExceptions: true
+      }
+    );
     
-    // Crear la solicitud de inserción
-    Logger.log('Preparando solicitud multipart...');
-    const requestBody = Utilities.newBlob(JSON.stringify(metadata), 'application/json');
-    const boundary = Utilities.getUuid();
+    Logger.log('Código de respuesta de inicialización: ' + response.getResponseCode());
     
-    Logger.log('Construyendo cuerpo de la solicitud...');
-    const requestPayload = buildMultipartBody(boundary, requestBody, videoBlob);
-    
-    // Realizar la solicitud a la API
-    Logger.log('Ejecutando solicitud a la API de YouTube...');
-    const response = UrlFetchApp.fetch('https://www.googleapis.com/upload/youtube/v3/videos?part=snippet,status&uploadType=multipart', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + service.getAccessToken(),
-        'Content-Type': 'multipart/related; boundary=' + boundary
-      },
-      payload: requestPayload,
-      muteHttpExceptions: true
-    });
-    
-    const responseCode = response.getResponseCode();
-    const responseText = response.getContentText();
-    
-    Logger.log('Respuesta recibida. Código: ' + responseCode);
-    Logger.log('Respuesta: ' + responseText);
-    
-    if (responseCode !== 200) {
-      Logger.log('Error en la respuesta de YouTube');
-      throw new Error('Error al subir video a YouTube: ' + JSON.parse(responseText).error.message);
+    if (response.getResponseCode() !== 200) {
+      throw new Error('Error al inicializar la subida: ' + response.getContentText());
     }
     
-    const responseData = JSON.parse(responseText);
-    Logger.log('Video subido correctamente. ID: ' + responseData.id);
+    const headers = response.getHeaders();
+    const uploadUrl = headers['Location'] || headers['location'];
     
-    return responseData.id;
+    if (!uploadUrl) {
+      throw new Error('No se recibió URL de subida en la respuesta');
+    }
+    
+    Logger.log('URL de subida obtenida: ' + uploadUrl);
+    
+    return {
+      uploadUrl: uploadUrl
+    };
   } catch (error) {
-    Logger.log('Error en uploadVideoToYouTubeAPI: ' + error);
-    Logger.log('Stack: ' + error.stack);
-    throw new Error('Error al subir video a YouTube: ' + error.message);
+    Logger.log('Error en initializeUpload: ' + error);
+    throw error;
   }
 }
 
-// Función para subir un video a la API de YouTube
-function uploadVideoToYouTubeAPI(service, videoBlob, title, description) {
+function uploadChunk(service, uploadUrl, chunk, start, total) {
   try {
-    const metadata = {
-      snippet: {
-        title: title,
-        description: description || '',
-        categoryId: '22' // Categoría "People & Blogs"
-      },
-      status: {
-        privacyStatus: 'unlisted' // Video no listado
-      }
+    if (!uploadUrl) {
+      throw new Error('URL de subida no proporcionada');
+    }
+    
+    Logger.log(`Subiendo chunk: bytes ${start}-${start + chunk.length - 1}/${total}`);
+    
+    // Headers mínimos necesarios para la subida resumible
+    const headers = {
+      'Authorization': 'Bearer ' + service.getAccessToken(),
+      'Content-Range': `bytes ${start}-${start + chunk.length - 1}/${total}`,
+      'Content-Type': 'application/octet-stream'
     };
+
+    const options = {
+      method: 'PUT',
+      headers: headers,
+      payload: chunk,
+      muteHttpExceptions: true
+    };
+
+    Logger.log('Headers de subida:', JSON.stringify(headers));
     
-    // Crear la solicitud de inserción
-    const requestBody = Utilities.newBlob(JSON.stringify(metadata), 'application/json');
+    const response = UrlFetchApp.fetch(uploadUrl, options);
     
-    // Construir la URL de la API
-    const uploadUrl = 'https://www.googleapis.com/upload/youtube/v3/videos?part=snippet,status&uploadType=multipart';
+    const responseCode = response.getResponseCode();
+    Logger.log('Código de respuesta del chunk: ' + responseCode);
     
-    // Crear el límite para multipart
-    const boundary = Utilities.getUuid();
+    if (responseCode !== 308 && responseCode !== 200 && responseCode !== 201) {
+      const responseText = response.getContentText();
+      Logger.log('Respuesta de error: ' + responseText);
+      throw new Error('Error al subir chunk. Código: ' + responseCode + ' - ' + responseText);
+    }
     
-    // Construir el cuerpo multipart
-    const requestPayload = buildMultipartBody(boundary, requestBody, videoBlob);
-    
-    // Realizar la solicitud a la API
+    return response;
+  } catch (error) {
+    Logger.log('Error en uploadChunk: ' + error);
+    throw error;
+  }
+}
+
+// Función para verificar el progreso de la subida
+function checkUploadProgress(service, uploadUrl, total) {
+  try {
     const response = UrlFetchApp.fetch(uploadUrl, {
-      method: 'POST',
+      method: 'PUT',
       headers: {
         'Authorization': 'Bearer ' + service.getAccessToken(),
-        'Content-Type': 'multipart/related; boundary=' + boundary
+        'Content-Range': 'bytes */' + total
       },
-      payload: requestPayload,
       muteHttpExceptions: true
     });
     
-    const responseCode = response.getResponseCode();
-    const responseText = response.getContentText();
-    
-    if (responseCode !== 200) {
-      Logger.log('Error al subir video a YouTube: ' + responseText);
-      throw new Error('Error al subir video a YouTube: ' + JSON.parse(responseText).error.message);
+    const range = response.getHeaders()['Range'];
+    if (range) {
+      const match = range.match(/bytes=0-(\d+)/);
+      if (match) {
+        return parseInt(match[1]) + 1;
+      }
     }
+    return 0;
+  } catch (error) {
+    Logger.log('Error en checkUploadProgress: ' + error);
+    return 0;
+  }
+}
+
+function completeUpload(service, uploadUrl) {
+  const response = UrlFetchApp.fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      'Authorization': 'Bearer ' + service.getAccessToken()
+    },
+    muteHttpExceptions: true
+  });
+  
+  if (response.getResponseCode() !== 200) {
+    throw new Error('Error al completar la subida: ' + response.getContentText());
+  }
+  
+  const responseData = JSON.parse(response.getContentText());
+  return responseData.id;
+}
+
+function updateUploadProgress(progress) {
+  // Almacenar el progreso en las propiedades del script para que el frontend pueda consultarlo
+  SCRIPT_PROPERTIES.setProperty('UPLOAD_PROGRESS', progress.toString());
+}
+
+// Función para que el frontend consulte el progreso
+function getUploadProgress() {
+  const progress = SCRIPT_PROPERTIES.getProperty('UPLOAD_PROGRESS');
+  return progress ? parseInt(progress) : 0;
+}
+
+function uploadVideoToYouTubeAPI(service, videoBlob, title, description) {
+  try {
+    Logger.log('Preparando metadata del video...');
+    const metadata = {
+      snippet: {
+        title: title,
+        description: description || ''
+      },
+      status: {
+        privacyStatus: 'unlisted'
+      }
+    };
     
+    const boundary = '-------314159265358979323846';
+    const delimiter = "\r\n--" + boundary + "\r\n";
+    const close_delim = "\r\n--" + boundary + "--";
+
+    Logger.log('Construyendo payload...');
+    const contentType = videoBlob.getContentType();
+    let multipartRequestBody =
+        delimiter +
+        'Content-Type: application/json\r\n\r\n' +
+        JSON.stringify(metadata) +
+        delimiter +
+        'Content-Type: ' + contentType + '\r\n' +
+        'Content-Transfer-Encoding: base64\r\n' +
+        '\r\n' +
+        Utilities.base64Encode(videoBlob.getBytes()) +
+        close_delim;
+
+    Logger.log('Configurando opciones de la solicitud...');
+    const options = {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + service.getAccessToken(),
+        'Content-Type': 'multipart/related; boundary="' + boundary + '"',
+        'X-Upload-Content-Length': videoBlob.getBytes().length,
+      },
+      payload: multipartRequestBody,
+      muteHttpExceptions: true
+    };
+
+    Logger.log('Enviando solicitud a la API de YouTube...');
+    const response = UrlFetchApp.fetch(
+      'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status',
+      options
+    );
+
+    Logger.log('Código de respuesta: ' + response.getResponseCode());
+    const responseText = response.getContentText();
+    Logger.log('Respuesta: ' + responseText);
+
+    if (response.getResponseCode() !== 200) {
+      throw new Error('Error en la respuesta de la API: ' + responseText);
+    }
+
     const responseData = JSON.parse(responseText);
     return responseData.id;
+    
   } catch (error) {
     Logger.log('Error en uploadVideoToYouTubeAPI: ' + error);
-    throw new Error('Error al subir video a YouTube: ' + error.message);
+    throw error;
   }
 }
 
@@ -759,18 +875,63 @@ function buildMultipartBody(boundary, metadata, media) {
 
 // Función para obtener el servicio de YouTube
 function getYouTubeService() {
+  Logger.log('Configurando servicio de YouTube...');
+  
   const clientId = SCRIPT_PROPERTIES.getProperty('YOUTUBE_CLIENT_ID');
   const clientSecret = SCRIPT_PROPERTIES.getProperty('YOUTUBE_CLIENT_SECRET');
   
-  return OAuth2.createService('youtube')
-    .setAuthorizationBaseUrl('https://accounts.google.com/o/oauth2/auth')
-    .setTokenUrl('https://accounts.google.com/o/oauth2/token')
+  if (!clientId || !clientSecret) {
+    Logger.log('Error: No se encontraron credenciales de YouTube');
+    throw new Error('Credenciales de YouTube no configuradas');
+  }
+
+  Logger.log('Credenciales encontradas, creando servicio...');
+  
+  return OAuth2.createService('YouTube')
+    .setAuthorizationBaseUrl('https://accounts.google.com/o/oauth2/v2/auth')
+    .setTokenUrl('https://oauth2.googleapis.com/token')
     .setClientId(clientId)
     .setClientSecret(clientSecret)
     .setPropertyStore(PropertiesService.getUserProperties())
+    .setCache(CacheService.getUserCache())
     .setScope('https://www.googleapis.com/auth/youtube.upload')
+    .setCallbackFunction('authCallback')
     .setParam('access_type', 'offline')
-    .setParam('approval_prompt', 'force');
+    .setParam('prompt', 'consent')
+    .setParam('response_type', 'code');
+}
+
+// Función de callback para la autenticación
+function authCallback(request) {
+  Logger.log('Ejecutando callback de autenticación...');
+  
+  const service = getYouTubeService();
+  const authorized = service.handleCallback(request);
+  
+  if (authorized) {
+    Logger.log('Autorización exitosa');
+    return HtmlService.createHtmlOutput('Autorización completada. Puede cerrar esta ventana.');
+  } else {
+    Logger.log('Error en la autorización');
+    return HtmlService.createHtmlOutput('Error en la autorización. Por favor, intente nuevamente.');
+  }
+}
+
+// Función para verificar el estado de autorización de YouTube
+function checkYouTubeAuth() {
+  try {
+    const service = getYouTubeService();
+    return {
+      hasAccess: service.hasAccess(),
+      authUrl: service.hasAccess() ? null : service.getAuthorizationUrl()
+    };
+  } catch (error) {
+    Logger.log('Error en checkYouTubeAuth: ' + error);
+    return {
+      hasAccess: false,
+      error: error.message
+    };
+  }
 }
 
 // Función para obtener usuarios de Asana
@@ -811,7 +972,6 @@ function createUser(name, email, role, password) {
   try {
     // Verificar si el usuario ya existe
     const existingUser = getUserByEmail(email);
-    
     if (existingUser) {
       throw new Error('Ya existe un usuario con ese email');
     }
@@ -898,7 +1058,6 @@ function deleteUser(userId) {
     
     // Buscar el usuario
     const userIndex = usersData.findIndex(user => user.id === userId);
-    
     if (userIndex === -1) {
       throw new Error('Usuario no encontrado');
     }
@@ -974,7 +1133,6 @@ function updateFieldPermission(fieldId, role, permission) {
     
     // Buscar el permiso existente
     const permissionIndex = permissionsData.findIndex(p => p.fieldId === fieldId && p.role === role);
-    
     if (permissionIndex === -1) {
       // Crear un nuevo permiso
       permissionsData.push({
@@ -1214,7 +1372,6 @@ function getContentTypeFromBase64(base64Data) {
 // Función para obtener la clave API de Asana
 function getAsanaApiKey() {
   const apiKey = SCRIPT_PROPERTIES.getProperty('ASANA_API_KEY');
-  
   if (!apiKey) {
     throw new Error('No se ha configurado la clave API de Asana');
   }
