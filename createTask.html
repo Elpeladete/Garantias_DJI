@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #f9f9f9;
+      color: #333;
+      margin: 0;
+      padding: 20px;
+    }
+    .task-form {
+      background-color: #fff;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      padding: 24px;
+      max-width: 500px;
+      margin: auto;
+    }
+    .task-form h2 {
+      text-align: center;
+      color: #006600;
+      margin-bottom: 20px;
+      font-size: 22px;
+    }
+    .task-form label {
+      display: block;
+      margin: 10px 0 5px;
+      color: #006600;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .task-form input,
+    .task-form textarea {
+      width: calc(100% - 22px);
+      padding: 12px;
+      margin-bottom: 15px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      font-size: 14px;
+      transition: border-color 0.3s ease;
+    }
+    .task-form input:focus,
+    .task-form textarea:focus {
+      outline: none;
+      border-color: #006600;
+      box-shadow: 0 0 0 2px rgba(0, 102, 0, 0.1);
+    }
+    .task-form textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+    .form-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 20px;
+    }
+    .task-form button {
+      flex: 1;
+      padding: 12px;
+      background-color: #006600;
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-weight: 500;
+      transition: background-color 0.3s ease;
+    }
+    .task-form button:hover {
+      background-color: #004d00;
+    }
+    .task-form button.cancel {
+      background-color: #f5f5f5;
+      color: #666;
+      border: 1px solid #ddd;
+    }
+    .task-form button.cancel:hover {
+      background-color: #e0e0e0;
+    }
+    .required {
+      color: #d32f2f;
+      margin-left: 3px;
+    }
+    .error-message {
+      color: #d32f2f;
+      font-size: 13px;
+      margin-top: -10px;
+      margin-bottom: 10px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="task-form">
+    <h2>Crear Nueva Tarea</h2>
+    <form id="newTaskForm">
+      <label for="taskName">Nombre de la Tarea<span class="required">*</span>:</label>
+      <input type="text" id="taskName" placeholder="Nombre descriptivo de la tarea" required>
+      <div id="taskNameError" class="error-message">Por favor, ingrese el nombre de la tarea.</div>
+      
+      <label for="taskNotes">Notas de la Tarea:</label>
+      <textarea id="taskNotes" placeholder="Descripción detallada, pasos a seguir, o cualquier información relevante"></textarea>
+      
+      <div class="form-actions">
+        <button type="button" class="cancel" onclick="goBack()">Cancelar</button>
+        <button type="submit">Crear Tarea</button>
+      </div>
+    </form>
+  </div>
+  <script>
+    // Validación del formulario
+    document.getElementById('newTaskForm').addEventListener('submit', function(event) {
+      event.preventDefault();
+      
+      const taskName = document.getElementById('taskName').value.trim();
+      const taskNotes = document.getElementById('taskNotes').value.trim();
+      
+      // Validar nombre de tarea
+      if (!taskName) {
+        document.getElementById('taskNameError').style.display = 'block';
+        document.getElementById('taskName').focus();
+        return;
+      } else {
+        document.getElementById('taskNameError').style.display = 'none';
+      }
+      
+      // Mostrar indicador de carga
+      document.body.innerHTML += `
+        <div id="loadingOverlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
+                                       background: rgba(0,0,0,0.5); display: flex; justify-content: center; 
+                                       align-items: center; z-index: 1000;">
+          <div style="background: white; padding: 20px; border-radius: 8px; text-align: center;">
+            <div style="border: 4px solid #f3f3f3; border-top: 4px solid #006600; border-radius: 50%; 
+                       width: 30px; height: 30px; margin: 0 auto 15px; animation: spin 2s linear infinite;"></div>
+            <p>Creando tarea...</p>
+          </div>
+        </div>
+        <style>
+          @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+          }
+        </style>
+      `;
+      
+      // Enviar datos al servidor
+      google.script.run
+        .withSuccessHandler(function(response) {
+          alert('Tarea creada exitosamente.');
+          goBack();
+        })
+        .withFailureHandler(function(error) {
+          // Eliminar overlay de carga
+          document.getElementById('loadingOverlay').remove();
+          alert('Error al crear la tarea: ' + error.message);
+        })
+        .createNewTask(taskName, taskNotes);
+    });
+    
+    // Función para volver a la página anterior
+    function goBack() {
+      google.script.run.withSuccessHandler(function(content) {
+        document.open();
+        document.write(content);
+        document.close();
+      }).showInterface();
+    }
+  </script>
+</body>
+</html>
